@@ -171,13 +171,16 @@ class CloudWatchKeywords(LibraryComponent):
             response = client.get_query_results(queryId=query_id)
             status = response['status']
             logger.debug(f"CloudWatch Logs Insights Query status={status}")
-            if status in ('Complete', 'Failed', 'Cancelled', 'Timeout'):
+            # LocalStack may return 'Scheduled' before 'Running'.
+            if status not in ('Running', 'Scheduled'):
                 break
             time.sleep(float(poll_interval))
-        else:
+
+        if response is None or response['status'] not in ('Complete', 'Failed', 'Cancelled', 'Timeout'):
+            last = response['status'] if response else 'unknown'
             raise TimeoutError(
                 f"CloudWatch Logs Insights query {query_id} did not complete within {timeout}s "
-                f"(last status: {response['status'] if response else 'unknown'})"
+                f"(last status: {last})"
             )
 
         if response['status'] != 'Complete':
