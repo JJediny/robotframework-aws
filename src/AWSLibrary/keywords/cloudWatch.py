@@ -68,6 +68,138 @@ class CloudWatchKeywords(LibraryComponent):
         results = [sublist[1:] for sublist in response['results']]
         return results
 
+    # ------------------------------------------------------------------
+    # Advanced Insights keyword: absolute time window, full result rows,
+    # queryId/statistics passback, configurable timeout, multi-account
+    # CloudTrail pattern support.
+    # ------------------------------------------------------------------
+
+    @keyword('CloudWatch Logs Insights Query')
+    def insights_query_advanced(
+        self,
+        log_group,
+        query,
+        start_epoch=None,
+        end_epoch=None,
+        start_time=60,
+        timeout=120,
+        poll_interval=2,
+        return_metadata=False,
+        log_group_names=None,
+    ):
+        """Execute a CloudWatch Logs Insights query with absolute time windows and full result metadata.
+
+        This keyword extends `CloudWatch Logs Insights` with:
+
+        - Absolute epoch-second timestamps (``start_epoch`` / ``end_epoch``) so you
+          can target specific investigation windows instead of only "N minutes ago".
+        - A configurable ``timeout`` to avoid tests hanging on large scans.
+        - A configurable ``poll_interval`` to tune cost vs. latency.
+        - Optional ``return_metadata`` flag that returns a dictionary with
+          ``results``, ``queryId``, and ``statistics`` for cost/scan visibility.
+        - Optional ``log_group_names`` list for multi-log-group queries (e.g.
+          querying a consolidated organization CloudTrail log group alongside
+          VPC Flow Logs in a single call).
+
+        *Consolidated payer-account CloudTrail pattern* — the recommended AWS
+        Organizations best practice is to enable organization-level CloudTrail
+        with a single destination log group in the management (payer) account
+        (e.g. ``/aws/cloudtrail/org``). All member-account events land in one
+        place, avoiding per-account session switching. Set ``LOG_GROUP_NAME``
+        (or pass ``log_group``) to the payer account log group and filter by
+        ``recipientAccountId`` inside the query to scope to individual accounts:
+
+        | ``fields @timestamp, recipientAccountId, userIdentity.arn, eventName``
+        | ``| filter recipientAccountId = "123456789012"``
+        | ``| sort @timestamp desc | limit 50``
+
+        | =Arguments= | =Description= |
+        | ``log_group`` | <str> Primary log group name. |
+        | ``query`` | <str> CloudWatch Logs Insights query string. |
+        | ``start_epoch`` | <int|None> Query start as Unix epoch seconds. Overrides ``start_time`` when set. |
+        | ``end_epoch`` | <int|None> Query end as Unix epoch seconds. Defaults to now when ``start_epoch`` is set. |
+        | ``start_time`` | <int> Minutes-ago fallback used when ``start_epoch`` is None (default: 60). |
+        | ``timeout`` | <int> Seconds to wait for query completion before raising (default: 120). |
+        | ``poll_interval`` | <float> Seconds between poll attempts (default: 2). |
+        | ``return_metadata`` | <bool> When True returns ``{results, queryId, statistics}`` instead of a plain list (default: False). |
+        | ``log_group_names`` | <list|None> Additional log group names for cross-log-group queries (default: None). |
+
+        ---
+        *Examples:*
+
+        Simple relative window (behaves like `CloudWatch Logs Insights`):
+        | ${rows} | CloudWatch Logs Insights Query | /aws/cloudtrail/org | fields @timestamp, eventName \\| limit 20 |
+
+        Absolute investigation window:
+        | ${start}= | Evaluate | int(time.mktime(time.strptime("2026-08-01", "%Y-%m-%d"))) | modules=time
+        | ${end}= | Evaluate | int(time.mktime(time.strptime("2026-08-31", "%Y-%m-%d"))) | modules=time
+        | ${rows} | CloudWatch Logs Insights Query | /aws/cloudtrail/org | fields @timestamp, eventName \\| limit 20 | start_epoch=${start} | end_epoch=${end} |
+
+        Multi-log-group cross-account query:
+        | ${rows} | CloudWatch Logs Insights Query | /aws/cloudtrail/org | fields @timestamp, eventName \\| limit 20 | log_group_names=["/aws/vpc/flowlogs"] |
+
+        Return queryId and scan statistics:
+        | ${meta} | CloudWatch Logs Insights Query | /aws/cloudtrail/org | fields @timestamp \\| limit 1 | return_metadata=${True} |
+        | Log | Query ID: ${meta['queryId']} |
+        | Log | Scanned bytes: ${meta['statistics']['bytesScanned']} |
+        """
+        client = self.library.session.client('logs', endpoint_url=self.endpoint_url)
+
+        if start_epoch is not None:
+            t_start = int(start_epoch)
+            t_end = int(end_epoch) if end_epoch is not None else int(datetime.now().timestamp())
+        else:
+            t_start = int((datetime.now() - timedelta(minutes=int(start_time))).timestamp())
+            t_end = int(datetime.now().timestamp())
+
+        params = {
+            'logGroupName': log_group,
+            'startTime': t_start,
+            'endTime': t_end,
+            'queryString': query,
+        }
+        if log_group_names:
+            params['logGroupNames'] = list(log_group_names)
+
+        resp = client.start_query(**params)
+        query_id = resp['queryId']
+        logger.info(f"CloudWatch Logs Insights Query started: queryId={query_id}")
+
+        deadline = time.time() + float(timeout)
+        response = None
+        while time.time() < deadline:
+            response = client.get_query_results(queryId=query_id)
+            status = response['status']
+            logger.debug(f"CloudWatch Logs Insights Query status={status}")
+            if status in ('Complete', 'Failed', 'Cancelled', 'Timeout'):
+                break
+            time.sleep(float(poll_interval))
+        else:
+            raise TimeoutError(
+                f"CloudWatch Logs Insights query {query_id} did not complete within {timeout}s "
+                f"(last status: {response['status'] if response else 'unknown'})"
+            )
+
+        if response['status'] != 'Complete':
+            raise RuntimeError(
+                f"CloudWatch Logs Insights query {query_id} ended with status={response['status']}"
+            )
+
+        rows = response.get('results', [])
+        statistics = response.get('statistics', {})
+        logger.info(
+            f"CloudWatch Logs Insights Query complete: queryId={query_id} "
+            f"rows={len(rows)} scannedBytes={statistics.get('bytesScanned', 'n/a')}"
+        )
+
+        if return_metadata:
+            return {
+                'results': rows,
+                'queryId': query_id,
+                'statistics': statistics,
+            }
+        return rows
+
     @keyword('CloudWatch Wait For Logs')
     def wait_for_logs(self, log_group, filter_pattern, regex_pattern, seconds_behind=60, timeout=30,
                       not_found_fail=False):
